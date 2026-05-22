@@ -10,15 +10,48 @@ CSA routing algorithm + route confidence calculations
 # %%
 
 
+# %%
+# #!/usr/bin/env python
+# coding: utf-8
+# %%
+'''
+algorithm.py
+CSA routing algorithm + route confidence calculations
+'''
+
+
+# %%
+
+
 ######################## pasted from Assignment 1 - com490.py
 
 import numpy as np
 from collections import defaultdict
 from scipy.stats import norm
 
+from delay_model import (
+    build_delay_distribution_tables,
+    collect_distribution_tables,
+    DelayLookup,
+    DOW_BUCKET_WEEKDAY,
+    DOW_BUCKET_SATURDAY,
+    DOW_BUCKET_SUNDAY,
+)
+
 
 DAY_COLUMNS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
 WALK_SPEED_M_PER_SEC = 50 / 60  # assignment spec: 50m per minute
+
+# Maps day name to the dow_bucket string expected by DelayLookup
+_DAY_TO_DOW_BUCKET = {
+    'monday':    DOW_BUCKET_WEEKDAY,
+    'tuesday':   DOW_BUCKET_WEEKDAY,
+    'wednesday': DOW_BUCKET_WEEKDAY,
+    'thursday':  DOW_BUCKET_WEEKDAY,
+    'friday':    DOW_BUCKET_WEEKDAY,
+    'saturday':  DOW_BUCKET_SATURDAY,
+    'sunday':    DOW_BUCKET_SUNDAY,
+}
 
 # Column indices in the numpy connection array — keep these in sync with
 # the column order in prepare_from_data() so we never have magic numbers in the scan loop
@@ -30,23 +63,34 @@ C_TRIP_IDX = 4   # index into self.trip_ids list (numpy can't store strings)
 # columns 5..11 are the day-of-week boolean flags (monday=5 .. sunday=11)
 C_DAY_BASE  = 5
 
+
 class JourneyPlanner:
 
     def __init__(self):
         # populated by prepare_from_data()
-        self.stops         = {}   # stop_id (int) -> {name, lat, lon}
-        self.walking       = {}   # stop_id -> [(neighbor_id, distance_m)]
-        self.trip_ids      = []   # list of trip_id strings, indexed by C_TRIP_IDX
-        self.delay_features = {}  # (stop_id, hour_of_day) -> (avg_delay_sec, std_delay_sec)
+        self.stops          = {}   # stop_id (int) -> {name, lat, lon}
+        self.walking        = {}   # stop_id -> [(neighbor_id, distance_m)]
+        self.trip_ids       = []   # list of trip_id strings, indexed by C_TRIP_IDX
+        self.trip_products  = {}   # trip_id (str) -> product_id_clean (str|None)
+        self.trip_lines     = {}   # trip_id (str) -> line_text (str|None)
+        self.trip_labels = {}   # trip_id -> route_label
+
+        # STEP 3: primary delay model — empirical CDFs via DelayLookup.
+        # Falls back to Normal model (delay_features) when None.
+        self.delay_lookup   = None  # DelayLookup | None
+
+        # Kept as fallback for when delay_training is unavailable.
+        self.delay_features = {}   # (stop_id, hour_of_day) -> (avg_delay_sec, std_delay_sec)
 
         # core CSA data structures
-        self.conn_arr   = None   # np.ndarray (N,12) sorted by dep_time for forward CSA
-        self.dep_times  = None   # 1-D view of C_DEP_TIME
-        self.arr_sorted = None   # np.ndarray (N,12) sorted by arr_time desc for backward CSA
+        self.conn_arr        = None   # np.ndarray (N,12) sorted by dep_time for forward CSA
+        self.dep_times       = None   # 1-D view of C_DEP_TIME
+        self.arr_sorted      = None   # np.ndarray (N,12) sorted by arr_time desc for backward CSA
+        self.arr_sorted_list = None   # list-of-lists cache — avoids repeated .tolist() in hot loop
 
     def prepare_from_data(self, data):
+        import pandas as _pd
         """Load routing data from PreparedData."""
-
         # stops
         for row in data.stops.collect():
             self.stops[int(row['stop_id'])] = {
@@ -64,12 +108,21 @@ class JourneyPlanner:
         trip_id_to_idx = {tid: i for i, tid in enumerate(unique_trips)}
         conn_pd['trip_idx'] = conn_pd['trip_id'].map(trip_id_to_idx)
 
+        if 'line_text' in conn_pd.columns:
+            _lt = conn_pd.drop_duplicates(subset='trip_id').set_index('trip_id')['line_text']
+            self.trip_lines = {tid: (None if _pd.isna(v) else str(v)) for tid, v in _lt.items()}
+        
+        if 'route_label' in conn_pd.columns:
+            _rl = conn_pd.drop_duplicates(subset='trip_id').set_index('trip_id')['route_label']
+            self.trip_labels = {tid: (None if _pd.isna(v) else str(v)) for tid, v in _rl.items()}
+
         day_cols = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
         self.conn_arr = conn_pd[
             ['dep_stop_id', 'dep_time_sec', 'arr_stop_id', 'arr_time_sec', 'trip_idx'] + day_cols
         ].astype('int64').values
         self.dep_times  = self.conn_arr[:, C_DEP_TIME]
-        self.arr_sorted = self.conn_arr[np.argsort(self.conn_arr[:, C_ARR_TIME])[::-1]]
+        self.arr_sorted      = self.conn_arr[np.argsort(self.conn_arr[:, C_ARR_TIME])[::-1]]
+        self.arr_sorted_list = self.arr_sorted.tolist()  # cache once — reused in every CSA scan
         print(f"Loaded {len(self.conn_arr)} connections")
 
         # walking edges
@@ -79,7 +132,19 @@ class JourneyPlanner:
             )
         print(f"Loaded walking edges for {len(self.walking)} stops")
 
-        # historical delay features — optional, only present when istdaten was prepared
+        # STEP 3: build DelayLookup from delay_training if available.
+        if data.delay_training is not None:
+            try:
+                levels = build_delay_distribution_tables(data.delay_training)
+                tables = collect_distribution_tables(levels, min_observations=30)
+                self.delay_lookup = DelayLookup.from_collected(tables)
+                print("Loaded DelayLookup with empirical distributions")
+            except Exception as e:
+                print(f"Warning: could not build DelayLookup ({e}). Falling back to Normal model.")
+                self.delay_lookup = None
+
+        # Fallback Normal model — loaded regardless so it's available if DelayLookup
+        # fails or delay_training is missing.
         if data.delay_features is not None:
             for row in data.delay_features.collect():
                 key = (int(row['bpuic']), int(row['hour_of_day']))
@@ -87,21 +152,27 @@ class JourneyPlanner:
                     float(row['hist_avg_delay_mins']) * 60,  # convert to seconds
                     float(row['hist_std_delay_mins']) * 60,
                 )
-            print(f"Loaded delay features for {len(self.delay_features)} (stop, hour) pairs")
+            print(f"Loaded fallback delay features for {len(self.delay_features)} (stop, hour) pairs")
         else:
-            print("No delay features available — confidence will default to 1.0")
+            if self.delay_lookup is None:
+                print("No delay data available — confidence will default to 1.0")
 
     def describe_route(self, route_result):
         """Print a single routes() result in human-readable form."""
-        dep  = route_result['dep_time']
-        arr  = route_result['arr_time']
-        conf = route_result['confidence']
-        fmt  = lambda s: f"{s // 3600:02d}:{(s % 3600) // 60:02d}"
-        print(f"Departure {fmt(dep)} → Arrival {fmt(arr)}  (confidence {conf:.0%})")
-        for ts, s1, trip_id, s2 in route_result['path']:
+        dep     = route_result['dep_time']
+        arr     = route_result['arr_time']
+        conf    = route_result['confidence']
+        n_tr    = route_result['n_transfers']
+        walk_m  = route_result['walk_m']
+        fmt     = lambda s: f"{s // 3600:02d}:{(s % 3600) // 60:02d}"
+        print(
+            f"Departure {fmt(dep)} → Arrival {fmt(arr)}  "
+            f"(confidence {conf:.0%}, {n_tr} transfer(s), {walk_m:.0f}m walking)"
+        )
+        for ts, s1, trip_id, s2, route_label in route_result['path']:
             t = fmt(ts)
             if trip_id and s2 is None:
-                print(f"  {t}  board  {trip_id}  at {self.stops.get(s1, {}).get('name', s1)}")
+                print(f"  {t}  board  {route_label}  at {self.stops.get(s1, {}).get('name', s1)}")
             elif trip_id and s1 is None:
                 print(f"  {t}  alight at {self.stops.get(s2, {}).get('name', s2)}")
             else:
@@ -109,15 +180,38 @@ class JourneyPlanner:
                 n2 = self.stops.get(s2, {}).get('name', s2)
                 print(f"  {t}  walk   {n1} → {n2}")
 
+    # ------------------------------------------------------------------
+    # STEP 1 — Multi-route Pareto collection
+    # ------------------------------------------------------------------
 
+
+    # helper to get human-readable route name
+    def _route_label(self, trip_id):
+        if trip_id is None:
+            return None
+        return self.trip_labels.get(trip_id) or self.trip_lines.get(trip_id) or str(trip_id)
+    
     def routes(self, start_id, end_id, arrives_by, day,
                confidence_threshold=0.9, max_routes=5,
                min_transfer_secs=120, max_walk_m=500):
         """
-        Find up to max_routes routes from start_id to end_id arriving before arrives_by.
+        Find up to max_routes routes from start_id to end_id arriving before arrives_by,
+        each with confidence >= confidence_threshold.
 
         Returns a list of dicts sorted from latest departure to earliest:
-            [{'path': [...], 'confidence': float, 'dep_time': int, 'arr_time': int}, ...]
+            [{
+                'path':         [...],
+                'confidence':   float,
+                'dep_time':     int,
+                'arr_time':     int,
+                'n_transfers':  int,   # STEP 4
+                'walk_m':       float, # STEP 4
+            }, ...]
+
+        STEP 1: low-confidence routes are skipped but do not terminate the search.
+        STEP 2: _backward_csa prunes connections during the scan.
+        STEP 3: dow_bucket threaded into empirical delay model.
+        STEP 4: n_transfers and walk_m exposed in each result dict.
         """
         if self.arr_sorted is None:
             raise RuntimeError("Call prepare_from_data() first")
@@ -130,63 +224,115 @@ class JourneyPlanner:
         if not 0 <= max_walk_m <= 500:
             raise ValueError("max_walk_m must be between 0 and 500")
 
-        h, m = arrives_by.split(':')
-        deadline = int(h) * 3600 + int(m) * 60
-        day_col  = C_DAY_BASE + DAY_COLUMNS.index(day.lower())
+        h, m        = arrives_by.split(':')
+        deadline    = int(h) * 3600 + int(m) * 60
+        day_col     = C_DAY_BASE + DAY_COLUMNS.index(day.lower())
+        dow_bucket  = _DAY_TO_DOW_BUCKET[day.lower()]
 
         results          = []
         current_deadline = deadline
+        max_attempts     = max_routes * 10
+        attempts         = 0
 
-        for _ in range(max_routes):
-            path = self._backward_csa(
+        while len(results) < max_routes and attempts < max_attempts:
+            attempts += 1
+
+            path, scan_confidence, n_transfers, walk_m = self._backward_csa(
                 start_id, end_id, current_deadline, day_col,
                 min_transfer_secs, max_walk_m,
+                confidence_threshold=confidence_threshold,
+                dow_bucket=dow_bucket,
             )
             if not path:
                 break
 
-            # Simplified confidence — replace with delay model later
-            confidence = self._confidence(path, min_transfer_secs)
-            if confidence < confidence_threshold:
-                break
-
             dep_time = path[0][0]
             arr_time = path[-1][0]
-            results.append({
-                'path':       path,
-                'confidence': confidence,
-                'dep_time':   dep_time,
-                'arr_time':   arr_time,
-            })
+            # Pareto pivot: use the last *transit* event time (alight or board), not
+            # arr_time.  When the final segment is a walk, arr_time == current_deadline
+            # (T[destination] = deadline), so arr_time - 1 would only decrement by one
+            # second each iteration, producing near-duplicate routes.  Walk events have
+            # event[2] = None (trip_id); transit events have event[2] != None.
+            last_transit_time = dep_time
+            for event in reversed(path):
+                if event[2] is not None:
+                    last_transit_time = event[0]
+                    break
+            current_deadline = last_transit_time - 1
 
-            current_deadline = dep_time - 1  # next route must depart strictly earlier
+            if scan_confidence >= confidence_threshold:
+                true_conf = (
+                    self._confidence(path, min_transfer_secs, dow_bucket=dow_bucket)
+                    if confidence_threshold == 0.0
+                    else scan_confidence
+                )
+                results.append({
+                    'path':        path,
+                    'confidence':  true_conf,
+                    'dep_time':    dep_time,
+                    'arr_time':    arr_time,
+                    'n_transfers': n_transfers,  # STEP 4
+                    'walk_m':      walk_m,        # STEP 4
+                })
 
         return results
 
+    # ------------------------------------------------------------------
+    # STEP 2 — Confidence integrated into the backward CSA scan
+    # STEP 4 — 4-criteria label tracking with dominance pruning
+    # ------------------------------------------------------------------
     def _backward_csa(self, start_id, end_id, deadline, day_col,
-                      min_transfer_secs, max_walk_m):
+                      min_transfer_secs, max_walk_m,
+                      confidence_threshold=0.0,
+                      dow_bucket=DOW_BUCKET_WEEKDAY):
         """
-        Backward CSA: find the latest-departing path from start_id reaching end_id by deadline.
+        Backward CSA: find the latest-departing path from start_id to end_id by deadline,
+        with confidence >= confidence_threshold at every transfer.
 
-        T[stop] = latest time we can board/depart from stop and still reach end_id in time.
+        Each stop label tracks four criteria:
+            T[stop]  — latest feasible departure time
+            C[stop]  — confidence of reaching end_id on time
+            N[stop]  — number of vehicle transfers so far on the path to end_id
+            W[stop]  — total walking distance (metres) so far on the path to end_id
+
+        STEP 4 — dominance pruning:
+            A new label (dep_time_new, c_new, n_new, w_new) replaces the existing
+            label at dep_stop only if it is not dominated. A new label dominates
+            the old one when dep_time_new > T[dep_stop] (strictly later departure),
+            OR when dep_time_new == T[dep_stop] and it is better on tie-breakers:
+            fewer transfers first, then less walking.
+
+            This matches the README requirement: "all other things being equal,
+            prefer routes with minimum walking distance and minimum number of transfers."
+
+        Returns:
+            (path, confidence, n_transfers, walk_m)
+            Returns ([], 0.0, 0, 0.0) if no path exists.
         """
         NEG_INF = -1
-        T           = defaultdict(lambda: NEG_INF)
+        INF_INT = 10 ** 9
+
+        T           = defaultdict(lambda: NEG_INF)   # stop -> latest feasible departure time
+        C           = defaultdict(float)              # stop -> confidence
+        N           = defaultdict(lambda: INF_INT)    # stop -> n_transfers
+        W           = defaultdict(lambda: float('inf'))  # stop -> total walk_m
         predecessor = {}
 
         T[end_id] = deadline
-        self._propagate_walking_backward(end_id, deadline, T, predecessor,
+        C[end_id] = 1.0
+        N[end_id] = 0
+        W[end_id] = 0.0
+        self._propagate_walking_backward(end_id, deadline, T, C, N, W, predecessor,
                                          min_transfer_secs, max_walk_m)
 
-        # trip_reachable[trip_idx] = True once a later segment of this trip has
-        # been accepted — no transfer buffer needed to continue on the same vehicle
-        trip_reachable = [False] * len(self.trip_ids)
+        trip_reachable  = [False] * len(self.trip_ids)
+        trip_confidence = [0.0]   * len(self.trip_ids)
+        trip_transfers  = [0]     * len(self.trip_ids)  # STEP 4
+        trip_walk_m     = [0.0]   * len(self.trip_ids)  # STEP 4
 
-        for row in self.arr_sorted.tolist():
+        for row in self.arr_sorted_list:
             arr_time = row[C_ARR_TIME]
 
-            # Early termination: any remaining connection has dep_time <= arr_time < T[start_id],
-            # so it cannot improve T[start_id] directly or through propagation.
             if T[start_id] != NEG_INF and arr_time < T[start_id]:
                 break
 
@@ -198,10 +344,6 @@ class JourneyPlanner:
             dep_time = row[C_DEP_TIME]
             trip_idx = row[C_TRIP_IDX]
 
-            # Can we use this connection to reach end_id?
-            # Already on this trip → traveler stays on the vehicle, no transfer needed
-            # Boarding for the first time → arr_stop must be reachable; at intermediate
-            #   stops min_transfer_secs must be available, but not at end_id itself
             if not trip_reachable[trip_idx]:
                 if T[arr_stop] == NEG_INF:
                     continue
@@ -209,79 +351,201 @@ class JourneyPlanner:
                 if arr_time + transfer > T[arr_stop]:
                     continue
 
-            # Does this connection let us depart later from dep_stop?
-            if dep_time <= T[dep_stop]:
-                continue
+                slack_sec  = T[arr_stop] - arr_time - transfer
+                trip_id    = self.trip_ids[trip_idx]
+                product_id = self.trip_products.get(trip_id)
+                line_text  = self.trip_lines.get(trip_id)
+                p_transfer = self._p_transfer(
+                    arr_stop, arr_time, slack_sec,
+                    confidence_threshold,
+                    dow_bucket=dow_bucket,
+                    product_id=product_id,
+                    line_text=line_text,
+                )
+
+                c_new = p_transfer * C[arr_stop]
+
+                if c_new < confidence_threshold:
+                    continue
+
+                # STEP 4: boarding a new trip costs one transfer (unless it's the
+                # very first vehicle from the origin — handled by N[end_id]=0 seed).
+                # A transfer is only counted when we board after having alighted,
+                # i.e. when arr_stop already has a label from a different trip.
+                # We conservatively count every new boarding as a transfer here;
+                # the origin boarding is absorbed because N[end_id] starts at 0.
+                n_new = N[arr_stop] + 1
+                w_new = W[arr_stop]  # no extra walking for a vehicle boarding
+
+            else:
+                # Continuing on the same vehicle — inherit all criteria unchanged.
+                c_new = trip_confidence[trip_idx]
+                n_new = trip_transfers[trip_idx]
+                w_new = trip_walk_m[trip_idx]
+
+            # STEP 4 — dominance check replaces the simple `dep_time <= T[dep_stop]` guard.
+            # A new label is accepted if:
+            #   (a) it departs strictly later (always better), OR
+            #   (b) it departs at the same time but has fewer transfers, OR
+            #   (c) it departs at the same time, same transfers, but less walking.
+            existing_time = T[dep_stop]
+            if dep_time < existing_time:
+                continue  # strictly worse on primary criterion — reject
+            if dep_time == existing_time:
+                if n_new > N[dep_stop]:
+                    continue  # same time, more transfers — reject
+                if n_new == N[dep_stop] and w_new >= W[dep_stop]:
+                    continue  # same time, same transfers, no walking improvement — reject
 
             trip_id               = self.trip_ids[trip_idx]
             T[dep_stop]           = dep_time
+            C[dep_stop]           = c_new
+            N[dep_stop]           = n_new
+            W[dep_stop]           = w_new
             predecessor[dep_stop] = (arr_stop, trip_id, dep_time, arr_time)
-            trip_reachable[trip_idx] = True
+            trip_reachable[trip_idx]  = True
+            trip_confidence[trip_idx] = c_new
+            trip_transfers[trip_idx]  = n_new
+            trip_walk_m[trip_idx]     = w_new
 
-            self._propagate_walking_backward(dep_stop, dep_time, T, predecessor,
+            self._propagate_walking_backward(dep_stop, dep_time, T, C, N, W, predecessor,
                                               min_transfer_secs, max_walk_m)
 
         if T[start_id] == NEG_INF:
-            return []
+            return [], 0.0, 0, 0.0
 
-        return self._reconstruct_backward_path(start_id, end_id, predecessor)
+        path = self._reconstruct_backward_path(start_id, end_id, predecessor)
+        if not path:
+            return [], 0.0, 0, 0.0
+
+        # N counts boardings from end_id outward; subtract 1 to get transfers
+        # (transfers = boardings - 1, minimum 0).
+        n_transfers = max(0, N[start_id] - 1)
+        return path, C[start_id], n_transfers, W[start_id]
+
+    # ------------------------------------------------------------------
+    # STEP 3 — Unified transfer probability using DelayLookup
+    # ------------------------------------------------------------------
+    def _p_transfer(self, stop_id, arr_time_sec, slack_sec, confidence_threshold,
+                    dow_bucket=DOW_BUCKET_WEEKDAY, product_id=None, line_text=None):
+        """
+        P(traveler catches the next connection) given slack_sec seconds of buffer
+        at stop_id.
+
+        Priority:
+          1. DelayLookup (empirical CDFs, 6-level fallback hierarchy).
+          2. Normal model from delay_features.
+          3. Returns 1.0 when neither is loaded, or when confidence_threshold == 0.0.
+        """
+        if confidence_threshold == 0.0:
+            return 1.0
+
+        if self.delay_lookup is not None:
+            hour = (arr_time_sec // 3600) % 24
+            try:
+                return self.delay_lookup.p_make_connection(
+                    arr_bpuic=stop_id,
+                    arr_hour=hour,
+                    dep_bpuic=stop_id,
+                    dep_hour=hour,
+                    dow_bucket=dow_bucket,
+                    slack_seconds=slack_sec,
+                    arr_product=product_id,
+                    dep_product=product_id,
+                    arr_line=line_text,
+                    dep_line=line_text,
+                )
+            except KeyError:
+                pass
+
+        if not self.delay_features:
+            return 1.0
+
+        hour  = (arr_time_sec // 3600) % 24
+        stats = self.delay_features.get((stop_id, hour))
+        if stats is None:
+            return 1.0
+
+        avg_sec, std_sec = stats
+        if std_sec <= 0:
+            return 1.0 if slack_sec >= avg_sec else 0.0
+
+        return float(norm.cdf(slack_sec, loc=avg_sec, scale=std_sec))
 
     def _reconstruct_backward_path(self, start_id, end_id, predecessor):
         """
         Reconstruct path from backward CSA predecessor dict.
         predecessor[stop] = (next_stop, trip_id, dep_time, arr_time)
-        so we follow forward from start_id to end_id.
         """
         if start_id not in predecessor:
-            print(f"No path found from stop {start_id}")
             return []
 
         events  = []
         current = start_id
+        visited = {start_id}
 
         while current != end_id:
             if current not in predecessor:
                 break
             next_stop, trip_id, dep_time, arr_time = predecessor[current]
+            if next_stop in visited:
+                return []  # cycle in predecessor graph — discard path
+            visited.add(next_stop)
 
             if trip_id is not None:
-                events.append((dep_time, current,   trip_id, None))      # board
-                events.append((arr_time, None,      trip_id, next_stop)) # alight
+                label = self._route_label(trip_id)
+                events.append((dep_time, current, trip_id, None, label))      # board
+                events.append((arr_time, None, trip_id, next_stop, label))    # alight
             else:
-                events.append((arr_time, current,   None,    next_stop)) # walk
+                events.append((dep_time, current, None, next_stop, None)) # walk
 
             current = next_stop
 
         return sorted(events, key=lambda x: x[0])
 
-    def _propagate_walking_backward(self, from_stop, from_time, T, predecessor,
+    def _propagate_walking_backward(self, from_stop, from_time, T, C, N, W, predecessor,
                                     min_transfer_secs, max_walk_m):
         """
-        Backward walking: if we can depart from_stop at from_time,
-        we can also depart a walking-neighbor earlier by walk_secs.
+        Backward walking propagation.
+
+        Walking edges carry no delay (P_walk = 1.0) and no transfer penalty,
+        so C and N are inherited unchanged. W is increased by the walking distance.
+
+        STEP 4: N and W parameters added so walking propagation carries all four
+        label criteria. Signature is internal-only — no external callers.
         """
         for neighbor, dist_m in self.walking.get(from_stop, []):
             if dist_m > max_walk_m:
                 continue
-            walk_secs      = int(dist_m / WALK_SPEED_M_PER_SEC)
-            t_at_neighbor  = from_time - walk_secs
-            if t_at_neighbor > T[neighbor]:
-                T[neighbor]           = t_at_neighbor
-                predecessor[neighbor] = (from_stop, None, t_at_neighbor, from_time)
+            walk_secs     = int(dist_m / WALK_SPEED_M_PER_SEC)
+            t_at_neighbor = from_time - walk_secs
+            w_at_neighbor = W[from_stop] + dist_m
 
-    def _confidence(self, path, min_transfer_secs):
+            # Apply the same dominance logic as the main scan loop.
+            existing_time = T[neighbor]
+            if t_at_neighbor < existing_time:
+                continue
+            if t_at_neighbor == existing_time:
+                if N[from_stop] > N[neighbor]:
+                    continue
+                if N[from_stop] == N[neighbor] and w_at_neighbor >= W[neighbor]:
+                    continue
+
+            T[neighbor]           = t_at_neighbor
+            C[neighbor]           = C[from_stop]
+            N[neighbor]           = N[from_stop]   # walking doesn't add a transfer
+            W[neighbor]           = w_at_neighbor  # STEP 4: accumulate walk distance
+            predecessor[neighbor] = (from_stop, None, t_at_neighbor, from_time)
+
+    def _confidence(self, path, min_transfer_secs, dow_bucket=DOW_BUCKET_WEEKDAY):
         """
-        Probability that the traveler catches every transfer on this path.
+        Post-hoc confidence calculation for a reconstructed path.
 
-        For each real transfer (alight trip A, board trip B), compute:
-            P(delay of A at alight_stop <= slack)
-        where slack = dep_time_B - arr_time_A and delay is modelled as
-        N(avg_delay_sec, std_delay_sec) from historical Istdaten.
-
-        Returns 1.0 when no delay features are loaded.
-        The overall confidence is the product of per-transfer probabilities.
+        Available for the validation harness and any external caller that wants
+        to independently verify the confidence of a given path. Internal routing
+        uses scan-integrated confidence via _p_transfer().
         """
-        if not self.delay_features:
+        if not self.delay_features and self.delay_lookup is None:
             return 1.0
 
         p_total          = 1.0
@@ -289,20 +553,20 @@ class JourneyPlanner:
         last_alight_time = None
         last_trip_id     = None
 
-        for ts, s1, trip_id, s2 in path:
+        for ts, s1, trip_id, s2, route_label in path:
             if trip_id is not None and s2 is None:  # board event
                 if last_alight_time is not None and trip_id != last_trip_id:
-                    # Real transfer: compute P(catch connection)
-                    slack_sec = ts - last_alight_time
-                    hour      = (last_alight_time // 3600) % 24
-                    stats     = self.delay_features.get((last_alight_stop, hour))
-                    if stats is not None:
-                        avg_sec, std_sec = stats
-                        if std_sec > 0:
-                            p_catch = float(norm.cdf(slack_sec, loc=avg_sec, scale=std_sec))
-                        else:
-                            p_catch = 1.0 if slack_sec >= avg_sec else 0.0
-                        p_total *= p_catch
+                    slack_sec  = ts - last_alight_time
+                    product_id = self.trip_products.get(trip_id)
+                    line_text  = self.trip_lines.get(trip_id)
+                    p_catch    = self._p_transfer(
+                        last_alight_stop, last_alight_time, slack_sec,
+                        confidence_threshold=1.0,
+                        dow_bucket=dow_bucket,
+                        product_id=product_id,
+                        line_text=line_text,
+                    )
+                    p_total *= p_catch
 
             elif trip_id is not None and s1 is None:  # alight event
                 last_alight_stop = s2
@@ -310,3 +574,264 @@ class JourneyPlanner:
                 last_trip_id     = trip_id
 
         return p_total
+
+    def explain_confidence(self, route_result, min_transfer_secs=120,
+                           dow_bucket=DOW_BUCKET_WEEKDAY):
+        """
+        Print a per-transfer confidence breakdown for a route result dict
+        (as returned by routes()).
+
+        Compresses consecutive board/alight events of the same trip into one leg,
+        and recomputes the true confidence regardless of the threshold used during
+        the original search.
+
+        Example usage:
+            results = planner.routes(start_id, end_id, '09:00', 'tuesday',
+                                     confidence_threshold=0.0)
+            planner.explain_confidence(results[0])
+        """
+        fmt  = lambda s: f"{s // 3600:02d}:{(s % 3600) // 60:02d}"
+        path = route_result['path']
+
+        # Recompute true confidence (route_result['confidence'] may be 1.0 when
+        # the search was run with confidence_threshold=0.0).
+        true_conf = self._confidence(path, min_transfer_secs, dow_bucket=dow_bucket)
+        print(f"Route: {fmt(route_result['dep_time'])} → {fmt(route_result['arr_time'])}  "
+              f"(true confidence: {true_conf:.0%})")
+        print()
+
+        # Compress consecutive board/alight events of the same trip into one leg
+        # so we only see trip boundaries (same logic as _compress_path in vis.py).
+        legs  = []   # each leg: (board_ts, board_stop, trip_id, alight_ts, alight_stop) | walk
+        i     = 0
+        while i < len(path):
+            ts, s1, trip_id, s2, route_label = path[i]
+            if trip_id is not None and s2 is None:   # board
+                board_ts, board_stop = ts, s1
+                last_alight_ts, last_alight_stop = None, None
+                j = i + 1
+                while j < len(path):
+                    ats, as1, atrip, as2, alabel = path[j]
+                    if atrip == trip_id and as1 is None:   # alight same trip
+                        last_alight_ts, last_alight_stop = ats, as2
+                        j += 1
+                        if j < len(path) and path[j][2] == trip_id and path[j][3] is None:
+                            j += 1   # skip re-board at same stop
+                            continue
+                    break
+                legs.append(('transit', board_ts, board_stop, trip_id,
+                             last_alight_ts, last_alight_stop))
+                i = j
+            else:                                         # walk
+                legs.append(('walk', ts, s1, s2))
+                i += 1
+
+        # Print legs and transfers
+        p_running        = 1.0
+        last_alight_stop = None
+        last_alight_time = None
+        last_trip_id     = None
+
+        for leg in legs:
+            if leg[0] == 'transit':
+                _, board_ts, board_stop, trip_id, alight_ts, alight_stop = leg
+                board_name  = self.stops.get(board_stop,  {}).get('name', board_stop)
+                alight_name = self.stops.get(alight_stop, {}).get('name', alight_stop)
+                line_text   = self.trip_lines.get(trip_id)
+
+                if last_alight_time is not None and trip_id != last_trip_id:
+                    prev_alight = self.stops.get(last_alight_stop, {}).get('name', last_alight_stop)
+                    slack_sec   = board_ts - last_alight_time
+                    p_catch     = self._p_transfer(
+                        last_alight_stop, last_alight_time, slack_sec,
+                        confidence_threshold=1.0,
+                        dow_bucket=dow_bucket,
+                        product_id=self.trip_products.get(trip_id),
+                        line_text=line_text,
+                    )
+                    p_running *= p_catch
+                    print(f"  ↔ Transfer: {prev_alight} {fmt(last_alight_time)}"
+                          f" → {board_name} {fmt(board_ts)}"
+                          f"  slack={slack_sec}s ({slack_sec//60}m{slack_sec%60:02d}s)"
+                          f"  P={p_catch:.0%}  cumul={p_running:.0%}")
+
+                tag = f"[{line_text}]" if line_text else f"[{trip_id}]"
+                print(f"  🚌 {fmt(board_ts)} Board  {board_name} → "
+                      f"Alight {alight_name} {fmt(alight_ts)}  {tag}")
+                last_alight_stop = alight_stop
+                last_alight_time = alight_ts
+                last_trip_id     = trip_id
+
+            else:   # walk
+                _, ts, s1, s2, _ = leg
+                n1 = self.stops.get(s1, {}).get('name', s1)
+                n2 = self.stops.get(s2, {}).get('name', s2)
+                print(f"  🚶 {fmt(ts)} Walk   {n1} → {n2}")
+
+    # ------------------------------------------------------------------
+    # Diagnostic helpers
+    # ------------------------------------------------------------------
+    def debug_route(self, start_id, end_id, arrives_by, day,
+                    confidence_threshold=0.8, min_transfer_secs=120,
+                    max_walk_m=500, watch_stops=()):
+        """
+        Run the backward CSA with verbose tracing for a handful of stops.
+
+        watch_stops: iterable of stop_ids whose T-value changes you want logged.
+        """
+        from collections import defaultdict
+
+        NEG_INF = -1
+        h, m = arrives_by.split(':')
+        deadline = int(h) * 3600 + int(m) * 60
+        day_col  = C_DAY_BASE + DAY_COLUMNS.index(day.lower())
+        dow_bucket = _DAY_TO_DOW_BUCKET[day.lower()]
+
+        def fmt(s): return f"{s//3600:02d}:{(s%3600)//60:02d}"
+
+        # ---- 1. Check walking edges from destination ----
+        print("=== Walking edges from destination ===")
+        dest_name = self.stops.get(end_id, {}).get('name', end_id)
+        print(f"Destination: {dest_name} (id={end_id})")
+        walk_from_dest = self.walking.get(end_id, [])
+        if not walk_from_dest:
+            print("  !! NO walking edges from destination — T[Castolin] will never be seeded!")
+        for nb, dist in sorted(walk_from_dest, key=lambda x: x[1]):
+            nb_name = self.stops.get(nb, {}).get('name', nb)
+            print(f"  → {nb_name} (id={nb})  {dist:.0f}m")
+
+        # ---- 2. Init T and walking propagation ----
+        T           = defaultdict(lambda: NEG_INF)
+        C           = defaultdict(float)
+        N           = defaultdict(lambda: 10**9)
+        W           = defaultdict(lambda: float('inf'))
+        predecessor = {}
+
+        T[end_id] = deadline; C[end_id] = 1.0; N[end_id] = 0; W[end_id] = 0.0
+        self._propagate_walking_backward(end_id, deadline, T, C, N, W, predecessor,
+                                         min_transfer_secs, max_walk_m)
+
+        print("\n=== T-values after initial walking propagation ===")
+        for sid, tv in sorted(T.items(), key=lambda x: -x[1]):
+            if tv == NEG_INF: continue
+            name = self.stops.get(sid, {}).get('name', sid)
+            print(f"  T[{name}] = {fmt(tv)}")
+
+        # ---- 3. Count how many connections land at each watched stop ----
+        watch_set = set(watch_stops) | {end_id}
+        print(f"\n=== Connections in arr_sorted_list landing at watched stops ===")
+        for sid in watch_set:
+            name = self.stops.get(sid, {}).get('name', sid)
+            hits = [(r[C_ARR_TIME], r[C_DEP_STOP], r[C_DEP_TIME])
+                    for r in self.arr_sorted_list
+                    if r[C_ARR_STOP] == sid and r[day_col]]
+            print(f"  arr_stop={name}: {len(hits)} connections on {day}")
+            for at, ds, dt in sorted(hits, key=lambda x: -x[0])[:5]:
+                ds_name = self.stops.get(ds, {}).get('name', ds)
+                print(f"    from {ds_name} dep={fmt(dt)} arr={fmt(at)}")
+            if len(hits) > 5:
+                print(f"    ... and {len(hits)-5} more")
+
+        # ---- 4. Full scan with logging for watched stops ----
+        trip_reachable  = [False] * len(self.trip_ids)
+        trip_confidence = [0.0]   * len(self.trip_ids)
+        trip_transfers  = [0]     * len(self.trip_ids)
+        trip_walk_m     = [0.0]   * len(self.trip_ids)
+
+        print(f"\n=== CSA scan (logging events for watched stops) ===")
+        break_reason = "exhausted"
+        for row in self.arr_sorted_list:
+            arr_time = row[C_ARR_TIME]
+
+            if T[start_id] != NEG_INF and arr_time < T[start_id]:
+                break_reason = f"early-exit: arr_time={fmt(arr_time)} < T[start]={fmt(T[start_id])}"
+                break
+
+            if not row[day_col]:
+                continue
+
+            dep_stop = row[C_DEP_STOP]
+            arr_stop = row[C_ARR_STOP]
+            dep_time = row[C_DEP_TIME]
+            trip_idx = row[C_TRIP_IDX]
+
+            in_watch = (dep_stop in watch_set or arr_stop in watch_set)
+
+            if not trip_reachable[trip_idx]:
+                if T[arr_stop] == NEG_INF:
+                    if in_watch:
+                        ds_n = self.stops.get(dep_stop,{}).get('name',dep_stop)
+                        as_n = self.stops.get(arr_stop,{}).get('name',arr_stop)
+                        print(f"  SKIP (T[{as_n}]=NEG_INF): {ds_n}→{as_n} dep={fmt(dep_time)} arr={fmt(arr_time)}")
+                    continue
+                transfer = 0 if arr_stop == end_id else min_transfer_secs
+                if arr_time + transfer > T[arr_stop]:
+                    if in_watch:
+                        ds_n = self.stops.get(dep_stop,{}).get('name',dep_stop)
+                        as_n = self.stops.get(arr_stop,{}).get('name',arr_stop)
+                        print(f"  SKIP (time): {ds_n}→{as_n} dep={fmt(dep_time)} arr={fmt(arr_time)} "
+                              f"arr+tr={fmt(arr_time+transfer)} > T[{as_n}]={fmt(T[arr_stop])}")
+                    continue
+
+                slack_sec  = T[arr_stop] - arr_time - transfer
+                trip_id    = self.trip_ids[trip_idx]
+                product_id = self.trip_products.get(trip_id)
+                line_text  = self.trip_lines.get(trip_id)
+                p_transfer = self._p_transfer(arr_stop, arr_time, slack_sec, confidence_threshold,
+                                              dow_bucket=dow_bucket,
+                                              product_id=product_id, line_text=line_text)
+                c_new = p_transfer * C[arr_stop]
+
+                if c_new < confidence_threshold:
+                    if in_watch:
+                        ds_n = self.stops.get(dep_stop,{}).get('name',dep_stop)
+                        as_n = self.stops.get(arr_stop,{}).get('name',arr_stop)
+                        print(f"  SKIP (conf {c_new:.0%}<{confidence_threshold:.0%}): "
+                              f"{ds_n}→{as_n} dep={fmt(dep_time)} arr={fmt(arr_time)}")
+                    continue
+
+                n_new = N[arr_stop] + 1
+                w_new = W[arr_stop]
+            else:
+                c_new = trip_confidence[trip_idx]
+                n_new = trip_transfers[trip_idx]
+                w_new = trip_walk_m[trip_idx]
+
+            existing_time = T[dep_stop]
+            if dep_time < existing_time:
+                continue
+            if dep_time == existing_time:
+                if n_new > N[dep_stop]: continue
+                if n_new == N[dep_stop] and w_new >= W[dep_stop]: continue
+
+            trip_id = self.trip_ids[trip_idx]
+            old_t   = T[dep_stop]
+            T[dep_stop]           = dep_time
+            C[dep_stop]           = c_new
+            N[dep_stop]           = n_new
+            W[dep_stop]           = w_new
+            predecessor[dep_stop] = (arr_stop, trip_id, dep_time, arr_time)
+            trip_reachable[trip_idx]  = True
+            trip_confidence[trip_idx] = c_new
+            trip_transfers[trip_idx]  = n_new
+            trip_walk_m[trip_idx]     = w_new
+
+            if in_watch or dep_stop in watch_set:
+                ds_n = self.stops.get(dep_stop,{}).get('name',dep_stop)
+                as_n = self.stops.get(arr_stop,{}).get('name',arr_stop)
+                print(f"  ACCEPT: {ds_n}→{as_n} dep={fmt(dep_time)} arr={fmt(arr_time)} "
+                      f"conf={c_new:.0%}  T[{ds_n}]: {fmt(old_t) if old_t!=NEG_INF else 'NEG_INF'}→{fmt(dep_time)}")
+
+            self._propagate_walking_backward(dep_stop, dep_time, T, C, N, W, predecessor,
+                                             min_transfer_secs, max_walk_m)
+            if dep_stop in watch_set:
+                for nb, dist in self.walking.get(dep_stop, []):
+                    if T[nb] != NEG_INF:
+                        nb_n = self.stops.get(nb,{}).get('name',nb)
+                        print(f"    walk→ {nb_n} T={fmt(T[nb])}")
+
+        print(f"\nScan ended: {break_reason}")
+        sn = self.stops.get(start_id,{}).get('name',start_id)
+        print(f"T[{sn}] = {fmt(T[start_id]) if T[start_id]!=NEG_INF else 'NEG_INF'}")
+
+# %%
