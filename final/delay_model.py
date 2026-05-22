@@ -22,34 +22,71 @@ Design notes
   whatever it prefers (analytic threshold or Monte Carlo convolution).
 """
 
-from __future__ import annotations
-
+import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
 
 import numpy as np
-
-if TYPE_CHECKING:
-    from pyspark.sql import DataFrame, SparkSession
 
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-QUANTILES: tuple[float, ...] = (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99)
-QUANTILE_COLS: tuple[str, ...] = tuple(f"q{int(q * 100):02d}" for q in QUANTILES)
+QUANTILES = (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99)
+QUANTILE_COLS = tuple(f"q{int(q * 100):02d}" for q in QUANTILES)
 
 DOW_BUCKET_WEEKDAY = "weekday"
 DOW_BUCKET_SATURDAY = "saturday"
 DOW_BUCKET_SUNDAY = "sunday"
+
+# Shift so that (delay + OFFSET_MIN) is strictly positive for all observations.
+OFFSET_MIN = 10.0
+
+# Splice point: empirical interpolation for the body, lognormal for the tails.
+SPLICE_QUANTILE = 0.95
+
+
+# ---------------------------------------------------------------------------
+# Pure-Python normal CDF / PPF (no scipy dependency at query time)
+# ---------------------------------------------------------------------------
+
+def _norm_cdf(z):
+    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+
+
+def _norm_ppf(p):
+    """Inverse standard-normal CDF (Acklam approximation, error < 1e-9)."""
+    a = (-3.969683028665376e+01,  2.209460984245205e+02,
+         -2.759285104469687e+02,  1.383577518672690e+02,
+         -3.066479806614716e+01,  2.506628277459239e+00)
+    b = (-5.447609879822406e+01,  1.615858368580409e+02,
+         -1.556989798598866e+02,  6.680131188771972e+01,
+         -1.328068155288572e+01)
+    c = (-7.784894002430293e-03, -3.223964580411365e-01,
+         -2.400758277161838e+00, -2.549732539343734e+00,
+          4.374664141464968e+00,  2.938163982698783e+00)
+    d = ( 7.784695709041462e-03,  3.224671290700398e-01,
+          2.445134137142996e+00,  3.754408661907416e+00)
+    plow, phigh = 0.02425, 1 - 0.02425
+    if p < plow:
+        q = math.sqrt(-2 * math.log(p))
+        return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+               ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    if p > phigh:
+        q = math.sqrt(-2 * math.log(1 - p))
+        return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+                ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    q = p - 0.5
+    r = q * q
+    return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q / \
+           (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1)
 
 
 # ---------------------------------------------------------------------------
 # Spark-side aggregation
 # ---------------------------------------------------------------------------
 
-def add_dow_bucket(df: "DataFrame", day_of_week_col: str = "day_of_week") -> "DataFrame":
+def add_dow_bucket(df, day_of_week_col="day_of_week"):
     """
     Map Spark's dayofweek (1=Sunday..7=Saturday) to weekday/saturday/sunday.
     """
@@ -64,11 +101,15 @@ def add_dow_bucket(df: "DataFrame", day_of_week_col: str = "day_of_week") -> "Da
     )
 
 
-def _agg_quantiles(df: "DataFrame", group_cols: list[str], target_col: str = "arr_delay_mins") -> "DataFrame":
+def _agg_quantiles(df, group_cols, target_col="arr_delay_mins"):
     """
-    Compute count + (mean, std) + the QUANTILES for `target_col` grouped by
-    `group_cols`. percentile_approx in a single call is much cheaper than
-    one call per quantile.
+    Compute count, mean, std, empirical quantiles, and shifted-lognormal
+    parameters for `target_col` grouped by `group_cols`.
+
+    The lognormal is fitted Spark-side via method-of-moments on the shifted
+    variable Y = target_col + OFFSET_MIN (strictly positive):
+        sigma^2 = ln(1 + Var[Y] / E[Y]^2)
+        mu      = ln(E[Y]) - sigma^2 / 2
     """
     from pyspark.sql import functions as F
 
@@ -82,13 +123,27 @@ def _agg_quantiles(df: "DataFrame", group_cols: list[str], target_col: str = "ar
     ]
     out = df.groupBy(*group_cols).agg(*aggs)
 
-    # Explode the quantile array into named columns.
     for i, name in enumerate(QUANTILE_COLS):
         out = out.withColumn(name, F.col("_qs").getItem(i))
-    return out.drop("_qs").fillna({"std": 0.0})
+    out = out.drop("_qs").fillna({"std": 0.0})
+
+    # Method-of-moments lognormal on the shifted variable.
+    offset       = F.lit(OFFSET_MIN)
+    shifted_mean = F.col("mean") + offset
+    variance     = F.col("std") * F.col("std")
+    ratio_safe   = F.greatest(F.lit(1.0) + variance / (shifted_mean * shifted_mean), F.lit(1.0 + 1e-9))
+    sigma_sq     = F.log(ratio_safe)
+    mu           = F.log(shifted_mean) - sigma_sq / F.lit(2.0)
+
+    return (
+        out
+        .withColumn("ln_offset", offset)
+        .withColumn("ln_sigma",  F.sqrt(sigma_sq))
+        .withColumn("ln_mu",     mu)
+    )
 
 
-def build_delay_distribution_tables(training_df: "DataFrame") -> dict[str, "DataFrame"]:
+def build_delay_distribution_tables(training_df):
     """
     Build all bucket-level quantile tables from the cleaned delay training
     table produced by build_delay_training_table().
@@ -100,26 +155,27 @@ def build_delay_distribution_tables(training_df: "DataFrame") -> dict[str, "Data
         bpuic_hour_dow  : (bpuic, hour_of_day, dow_bucket)
         bpuic_hour      : (bpuic, hour_of_day)
         bpuic           : (bpuic,)
+        line_hour_dow   : (line_text, hour_of_day, dow_bucket)
+        line            : (line_text,)
         prod_hour_dow   : (product_id_clean, hour_of_day, dow_bucket)
         prod            : (product_id_clean,)
         global          : ()
     """
     df = add_dow_bucket(training_df)
 
-    levels: dict[str, DataFrame] = {}
+    levels = {}
     levels["bpuic_hour_dow"] = _agg_quantiles(df, ["bpuic", "hour_of_day", "dow_bucket"])
     levels["bpuic_hour"]     = _agg_quantiles(df, ["bpuic", "hour_of_day"])
     levels["bpuic"]          = _agg_quantiles(df, ["bpuic"])
+    levels["line_hour_dow"]  = _agg_quantiles(df.filter("line_text IS NOT NULL"), ["line_text", "hour_of_day", "dow_bucket"])
+    levels["line"]           = _agg_quantiles(df.filter("line_text IS NOT NULL"), ["line_text"])
     levels["prod_hour_dow"]  = _agg_quantiles(df, ["product_id_clean", "hour_of_day", "dow_bucket"])
     levels["prod"]           = _agg_quantiles(df, ["product_id_clean"])
     levels["global"]         = _agg_quantiles(df, [])
     return levels
 
 
-def collect_distribution_tables(
-    levels: dict[str, "DataFrame"],
-    min_observations: int = 30,
-) -> dict[str, list[dict]]:
+def collect_distribution_tables(levels, min_observations=30):
     """
     Pull each Spark table to the driver as a list of dicts, dropping buckets
     that don't have enough observations to be trusted.
@@ -128,7 +184,7 @@ def collect_distribution_tables(
     """
     from pyspark.sql import functions as F
 
-    out: dict[str, list[dict]] = {}
+    out = {}
     for name, df in levels.items():
         rows = df.filter(F.col("n") >= F.lit(min_observations)).collect()
         out[name] = [r.asDict() for r in rows]
@@ -142,39 +198,67 @@ def collect_distribution_tables(
 @dataclass(frozen=True)
 class DelayDistribution:
     """
-    Empirical delay distribution for one bucket. Values are in minutes.
-    `qs` are the QUANTILES values; `quantiles` are the corresponding levels.
+    Hybrid empirical + lognormal delay distribution for one bucket (minutes).
+
+    CDF splice (matches Kristina's delay_model_draft.ipynb):
+      x <= q05_val          → shifted-lognormal lower tail
+      q05_val < x < q95_val → linear interpolation across empirical quantiles
+      x >= q95_val          → shifted-lognormal upper tail (fixes cap-at-0.99)
     """
     n: int
     mean: float
     std: float
-    quantiles: tuple[float, ...]
-    qs: tuple[float, ...]
-    source_level: str  # which fallback level produced this (for debugging)
+    quantiles: tuple
+    qs: tuple
+    ln_mu: float
+    ln_sigma: float
+    ln_offset: float
+    source_level: str
 
-    def cdf(self, x: float) -> float:
-        """
-        P(delay <= x) by linear interpolation across stored quantiles.
-        Outside the stored range, clip to [q_min, q_max] tail probabilities.
-        """
-        qs = self.qs
-        ps = self.quantiles
-        if x <= qs[0]:
-            # Below the lowest stored quantile: assume the tail probability.
-            return ps[0]
-        if x >= qs[-1]:
-            return ps[-1]
-        # Linear interp on (qs, ps).
+    def _lognormal_cdf(self, x):
+        shifted = x + self.ln_offset
+        if shifted <= 0.0:
+            return 0.0
+        if self.ln_sigma <= 0.0:
+            return 1.0 if x >= self.mean else 0.0
+        z = (math.log(shifted) - self.ln_mu) / self.ln_sigma
+        return _norm_cdf(z)
+
+    def _lognormal_ppf(self, p):
+        if self.ln_sigma <= 0.0:
+            return self.mean
+        p = min(max(p, 1e-12), 1.0 - 1e-12)
+        return math.exp(self.ln_mu + self.ln_sigma * _norm_ppf(p)) - self.ln_offset
+
+    def cdf(self, x):
+        """P(delay <= x) using empirical body + lognormal tails."""
+        qs, ps = self.qs, self.quantiles
+        splice_idx = ps.index(SPLICE_QUANTILE) if SPLICE_QUANTILE in ps else len(ps) - 2
+        if x <= qs[0] or x >= qs[splice_idx]:
+            return self._lognormal_cdf(x)
         return float(np.interp(x, qs, ps))
 
-    def sample(self, n: int, rng: np.random.Generator) -> np.ndarray:
-        """
-        Draw `n` samples by inverse-CDF sampling on the piecewise-linear CDF.
-        Used by the planner if it wants to convolve two delay distributions
-        rather than evaluate cdf(threshold) analytically.
-        """
-        u = rng.uniform(size=n)
-        return np.interp(u, self.quantiles, self.qs)
+    def sample(self, n, rng):
+        """Inverse-CDF sampling: lognormal PPF for tails, empirical for body."""
+        qs, ps = self.qs, self.quantiles
+        splice_idx = ps.index(SPLICE_QUANTILE) if SPLICE_QUANTILE in ps else len(ps) - 2
+        p_lo, p_hi = ps[0], ps[splice_idx]
+        u   = rng.uniform(size=n)
+        out = np.empty(n, dtype=np.float64)
+        body = (u > p_lo) & (u < p_hi)
+        if body.any():
+            out[body] = np.interp(u[body], ps, qs)
+        tail = ~body
+        if tail.any():
+            zs = np.fromiter(
+                (_norm_ppf(float(p)) for p in u[tail]),
+                dtype=np.float64, count=int(tail.sum()),
+            )
+            if self.ln_sigma > 0.0:
+                out[tail] = np.exp(self.ln_mu + self.ln_sigma * zs) - self.ln_offset
+            else:
+                out[tail] = self.mean
+        return out
 
 
 class DelayLookup:
@@ -189,25 +273,21 @@ class DelayLookup:
         p_on_time = dist.cdf(2.0)   # P(arrival delay <= 2 min)
     """
 
-    def __init__(
-        self,
-        bpuic_hour_dow: dict[tuple[int, int, str], DelayDistribution],
-        bpuic_hour: dict[tuple[int, int], DelayDistribution],
-        bpuic: dict[int, DelayDistribution],
-        prod_hour_dow: dict[tuple[str, int, str], DelayDistribution],
-        prod: dict[str, DelayDistribution],
-        global_dist: DelayDistribution | None,
-    ):
+    def __init__(self, bpuic_hour_dow, bpuic_hour, bpuic, line_hour_dow, line,
+                 prod_hour_dow, prod, global_dist):
         self.bpuic_hour_dow = bpuic_hour_dow
         self.bpuic_hour = bpuic_hour
         self.bpuic = bpuic
+        self.line_hour_dow = line_hour_dow
+        self.line = line
         self.prod_hour_dow = prod_hour_dow
         self.prod = prod
         self.global_dist = global_dist
 
         # Counters useful for "how often did we fall back?" diagnostics.
-        self.hits: dict[str, int] = {k: 0 for k in (
+        self.hits = {k: 0 for k in (
             "bpuic_hour_dow", "bpuic_hour", "bpuic",
+            "line_hour_dow", "line",
             "prod_hour_dow", "prod", "global", "miss",
         )}
 
@@ -216,14 +296,17 @@ class DelayLookup:
     # ------------------------------------------------------------------ #
 
     @classmethod
-    def from_collected(cls, tables: dict[str, list[dict]]) -> "DelayLookup":
-        def to_dist(row: dict, source: str) -> DelayDistribution:
+    def from_collected(cls, tables):
+        def to_dist(row, source):
             return DelayDistribution(
                 n=int(row["n"]),
                 mean=float(row["mean"]),
                 std=float(row["std"]),
                 quantiles=QUANTILES,
                 qs=tuple(float(row[c]) for c in QUANTILE_COLS),
+                ln_mu=float(row["ln_mu"]),
+                ln_sigma=float(row["ln_sigma"]),
+                ln_offset=float(row["ln_offset"]),
                 source_level=source,
             )
 
@@ -240,6 +323,17 @@ class DelayLookup:
             int(r["bpuic"]): to_dist(r, "bpuic")
             for r in tables.get("bpuic", [])
         }
+        line_hour_dow = {
+            (str(r["line_text"]), int(r["hour_of_day"]), str(r["dow_bucket"])):
+                to_dist(r, "line_hour_dow")
+            for r in tables.get("line_hour_dow", [])
+            if r.get("line_text") is not None
+        }
+        line = {
+            str(r["line_text"]): to_dist(r, "line")
+            for r in tables.get("line", [])
+            if r.get("line_text") is not None
+        }
         prod_hour_dow = {
             (str(r["product_id_clean"]), int(r["hour_of_day"]), str(r["dow_bucket"])):
                 to_dist(r, "prod_hour_dow")
@@ -254,19 +348,13 @@ class DelayLookup:
         global_rows = tables.get("global", [])
         global_dist = to_dist(global_rows[0], "global") if global_rows else None
 
-        return cls(bpuic_hour_dow, bpuic_hour, bpuic, prod_hour_dow, prod, global_dist)
+        return cls(bpuic_hour_dow, bpuic_hour, bpuic, line_hour_dow, line, prod_hour_dow, prod, global_dist)
 
     # ------------------------------------------------------------------ #
     # Query
     # ------------------------------------------------------------------ #
 
-    def get(
-        self,
-        bpuic: int,
-        hour: int,
-        dow_bucket: str,
-        product_id: str | None = None,
-    ) -> DelayDistribution:
+    def get(self, bpuic, hour, dow_bucket, product_id=None, line_text=None):
         """
         Return the most-specific distribution available for this query,
         falling back through the hierarchy. Always returns something as long
@@ -287,6 +375,16 @@ class DelayLookup:
             self.hits["bpuic"] += 1
             return d
 
+        if line_text is not None:
+            d = self.line_hour_dow.get((line_text, hour, dow_bucket))
+            if d is not None:
+                self.hits["line_hour_dow"] += 1
+                return d
+            d = self.line.get(line_text)
+            if d is not None:
+                self.hits["line"] += 1
+                return d
+
         if product_id is not None:
             d = self.prod_hour_dow.get((product_id, hour, dow_bucket))
             if d is not None:
@@ -304,24 +402,16 @@ class DelayLookup:
         self.hits["miss"] += 1
         raise KeyError(
             f"No delay distribution for bpuic={bpuic}, hour={hour}, "
-            f"dow={dow_bucket}, product={product_id} and no global fallback."
+            f"dow={dow_bucket}, line={line_text}, product={product_id} and no global fallback."
         )
 
     # ------------------------------------------------------------------ #
     # Convenience: connection-success probability
     # ------------------------------------------------------------------ #
 
-    def p_make_connection(
-        self,
-        arr_bpuic: int,
-        arr_hour: int,
-        dep_bpuic: int,
-        dep_hour: int,
-        dow_bucket: str,
-        slack_seconds: float,
-        arr_product: str | None = None,
-        dep_product: str | None = None,
-    ) -> float:
+    def p_make_connection(self, arr_bpuic, arr_hour, dep_bpuic, dep_hour,
+                          dow_bucket, slack_seconds, arr_product=None,
+                          dep_product=None, arr_line=None, dep_line=None):
         """
         P(can make the connection) under the independence assumption the
         assignment grants:
@@ -339,26 +429,22 @@ class DelayLookup:
 
         Returns a probability in [0, 1].
         """
-        arr_dist = self.get(arr_bpuic, arr_hour, dow_bucket, arr_product)
-        dep_dist = self.get(dep_bpuic, dep_hour, dow_bucket, dep_product)
+        arr_dist = self.get(arr_bpuic, arr_hour, dow_bucket, arr_product, arr_line)
+        dep_dist = self.get(dep_bpuic, dep_hour, dow_bucket, dep_product, dep_line)
         slack_min = slack_seconds / 60.0
 
         # Integration mesh: departure delay's stored quantile grid.
-        d_grid = np.asarray(dep_dist.qs, dtype=float)
+        d_grid  = np.asarray(dep_dist.qs, dtype=float)
         d_probs = np.asarray(dep_dist.quantiles, dtype=float)
 
-        # Vectorised F_A evaluated at (D + slack).
-        fa = np.interp(
-            d_grid + slack_min,
-            np.asarray(arr_dist.qs, dtype=float),
-            np.asarray(arr_dist.quantiles, dtype=float),
-            left=arr_dist.quantiles[0],
-            right=arr_dist.quantiles[-1],
-        )
+        # F_A evaluated at (D + slack) — uses hybrid CDF so the lognormal tail
+        # is applied when D + slack exceeds the empirical splice point.
+        fa = np.array([arr_dist.cdf(d + slack_min) for d in d_grid])
 
         # Trapezoidal rule over the stored quantile range of D, plus tail
-        # contributions outside [q_min, q_max] matching DelayDistribution.cdf.
-        integral = float(np.trapz(fa, d_probs))
+        # contributions. fa uses arr_dist.cdf() so it benefits from the
+        # lognormal tail for large D + slack values.
+        integral = float(getattr(np, "trapezoid", np.trapz)(fa, d_probs))
         integral += fa[0] * d_probs[0]              # mass below lowest quantile of D
         integral += fa[-1] * (1.0 - d_probs[-1])    # mass above highest quantile of D
 
@@ -369,7 +455,7 @@ class DelayLookup:
 # Helper: turn a Spark dayofweek (1..7) into the dow_bucket string
 # ---------------------------------------------------------------------------
 
-def dow_bucket_from_dayofweek(day_of_week: int) -> str:
+def dow_bucket_from_dayofweek(day_of_week):
     """1=Sunday, 7=Saturday in Spark conventions."""
     if day_of_week == 1:
         return DOW_BUCKET_SUNDAY
@@ -378,7 +464,7 @@ def dow_bucket_from_dayofweek(day_of_week: int) -> str:
     return DOW_BUCKET_WEEKDAY
 
 
-def dow_bucket_from_python_weekday(weekday: int) -> str:
+def dow_bucket_from_python_weekday(weekday):
     """0=Monday..6=Sunday for datetime.weekday()."""
     if weekday == 5:
         return DOW_BUCKET_SATURDAY
@@ -387,60 +473,36 @@ def dow_bucket_from_python_weekday(weekday: int) -> str:
     return DOW_BUCKET_WEEKDAY
 
 
-# +
-# Load data
-from data_prep import ProjectConfig, get_spark_session, prepare_project_data
-from pyspark.sql import functions as F
+if __name__ == '__main__':
+    from data_prep import ProjectConfig, get_spark_session, prepare_project_data
+    from pyspark.sql import functions as F
 
-cfg = ProjectConfig(
-    group_name="D1",
-    region_uuids=(
-            "a7a21b73-6ffe-4fbf-a635-6e2b961f3072",  # Lausanne
-            "e168fd57-f57a-4075-a350-0dcfbb55147f",  # Ouest lausannois
-        ),
-    start_date="2025-01-01",
-    end_date=None,
+    cfg = ProjectConfig(
+        group_name="D1",
+        region_uuids=(
+                "a7a21b73-6ffe-4fbf-a635-6e2b961f3072",  # Lausanne
+                "e168fd57-f57a-4075-a350-0dcfbb55147f",  # Ouest lausannois
+            ),
+        start_date="2025-01-01",
+        end_date=None,
+    )
 
-)
+    spark = get_spark_session(cfg)
+    from sedona.spark import SedonaContext
+    sedona = SedonaContext.create(spark)
+    data = prepare_project_data(spark, cfg)
 
-spark = get_spark_session(cfg)
-# Register Sedona's UDFs and types
-from sedona.spark import SedonaContext
-sedona = SedonaContext.create(spark)
-data = prepare_project_data(spark, cfg)
+    data.delay_training.select(F.min("operating_day"), F.max("operating_day"), F.count("*")).show()
 
-data.delay_training.select(F.min("operating_day"), F.max("operating_day"), F.count("*")).show()
-#print(f"Rows: {data.delay_training.count():,}")
-#print(f"Rows istdaten: {data.istdaten.count():,}")
-#data.istdaten.show(10, truncate=False)
+    levels = build_delay_distribution_tables(data.delay_training)
+    tables = collect_distribution_tables(levels, min_observations=30)
+    lookup = DelayLookup.from_collected(tables)
 
-# +
-# How to run
-# 1. Spark-side: aggregate quantiles at every bucket level
-levels = build_delay_distribution_tables(data.delay_training)
-
-# 2. Pull to driver, drop buckets with too few observations
-tables = collect_distribution_tables(levels, min_observations=30)
-
-# 3. Build the in-memory lookup (the planner imports this)
-lookup = DelayLookup.from_collected(tables)
-
-# Use it
-#dist = lookup.get(bpuic=8501120, hour=8, dow_bucket="weekday", product_id="Zug")
-#p_on_time = dist.cdf(2.0)
-
-# Connection probability for the planner
-p = lookup.p_make_connection(
-    arr_bpuic=8501120, arr_hour=8,
-    dep_bpuic=8501120, dep_hour=8,
-    dow_bucket="weekday",
-    slack_seconds=180,
-    arr_product="Zug", dep_product="Zug",
-)
-
-# -
-
-#print(p_on_time)
-print(p)
-
-
+    p = lookup.p_make_connection(
+        arr_bpuic=8501120, arr_hour=8,
+        dep_bpuic=8501120, dep_hour=8,
+        dow_bucket="weekday",
+        slack_seconds=180,
+        arr_product="Zug", dep_product="Zug",
+    )
+    print(p)
