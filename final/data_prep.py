@@ -28,15 +28,23 @@ Typical use from a notebook:
     data = prepare_project_data(spark, cfg)
 """
 
+# +
 import os
 import pwd
 import sys
 from random import randrange
 
-from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
-from pyspark.sql.window import Window
+from sedona.spark import SedonaContext
+# -
 
+try:
+    from pyspark.sql import SparkSession
+    from pyspark.sql import functions as F
+    from pyspark.sql.window import Window
+except ImportError:
+    SparkSession = None
+    F = None
+    Window = None
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -178,6 +186,9 @@ def get_spark_session(cfg):
         .getOrCreate()
     )
 
+    # This registers ST_GeomFromWKB, ST_Point, ST_Contains, etc.
+    sedona = SedonaContext.create(spark)
+
     spark.sql(f"CREATE SCHEMA IF NOT EXISTS spark_catalog.{username}")
     spark.sql(f"USE spark_catalog.{username}")
 
@@ -278,6 +289,21 @@ def product_id_from_route_type(route_type_col):
         .when(route_type_col.between(1300, 1499), "Zahnradbahn")
         .when(route_type_col == 401, "Metro")
         .when(route_type_col == 1500, "Taxi")
+    )
+
+
+def vehicle_type_from_route_type(route_type_col):
+    return (
+        F.when(route_type_col.isin(201, 202, 700, 702, 705, 710, 715), "bus")
+         .when(route_type_col == 401, "metro")
+         .when(route_type_col == 900, "tram")
+         .when(route_type_col.isin(100, 101, 102, 103, 104, 105, 106, 107, 109, 116, 117), "train")
+         .when(route_type_col == 1000, "boat")
+         .when(route_type_col == 1100, "airplane")
+         .when(route_type_col.isin(1300, 1303), "lift")
+         .when(route_type_col == 1400, "funicular")
+         .when(route_type_col == 1500, "taxi")
+         .otherwise("unknown")
     )
 
 
@@ -482,6 +508,21 @@ def build_region_stop_times(spark, cfg, region_stops):
         .distinct()
     )
 
+    routes = (
+        load_routes_table(spark, cfg)
+        .select(
+            "route_id",
+            F.col("route_short_name").alias("line_text"),
+            "route_type",
+        )
+        .distinct()
+        .withColumn("vehicle_type", vehicle_type_from_route_type(F.col("route_type")))
+        .withColumn(
+            "route_label",
+            F.concat_ws(" ", F.col("vehicle_type"), F.col("line_text"))
+        )
+    )
+
     return (
         stop_times
         .join(F.broadcast(relevant_trips), on="trip_id", how="inner")
@@ -495,6 +536,7 @@ def build_region_stop_times(spark, cfg, region_stops):
             on="service_id",
             how="inner",
         )
+        .join(F.broadcast(routes), on="route_id", how="left")
         .withColumn("stop_id", clean_timetable_stop_id(F.col("stop_id")))
         .withColumn("arrival_time_sec", hhmmss_to_seconds(F.col("arrival_time")))
         .withColumn("departure_time_sec", hhmmss_to_seconds(F.col("departure_time")))
@@ -504,6 +546,8 @@ def build_region_stop_times(spark, cfg, region_stops):
         .select(
             "trip_id",
             "route_id",
+            "line_text",
+            "route_label",
             "service_id",
             "stop_id",
             "stop_sequence",
@@ -537,6 +581,8 @@ def build_connections(stop_times):
         .select(
             F.col("a.trip_id").alias("trip_id"),
             F.col("a.route_id").alias("route_id"),
+            F.col("a.line_text").alias("line_text"),
+            F.col("a.route_label").alias("route_label"),
             F.col("a.stop_id").alias("dep_stop_id"),
             F.col("b.stop_id").alias("arr_stop_id"),
             F.col("a.departure_time_sec").alias("dep_time_sec"),
