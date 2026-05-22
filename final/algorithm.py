@@ -1,26 +1,3 @@
-#!/usr/bin/env python
-# coding: utf-8
-# %%
-'''
-algorithm.py
-CSA routing algorithm + route confidence calculations
-'''
-
-
-# %%
-
-
-# %%
-# #!/usr/bin/env python
-# coding: utf-8
-# %%
-'''
-algorithm.py
-CSA routing algorithm + route confidence calculations
-'''
-
-
-# %%
 
 
 ######################## pasted from Assignment 1 - com490.py
@@ -183,7 +160,16 @@ class JourneyPlanner:
     # ------------------------------------------------------------------
     # STEP 1 — Multi-route Pareto collection
     # ------------------------------------------------------------------
-
+    @staticmethod
+    def _trip_sequence(path):
+        """Return the ordered tuple of unique consecutive line labels used in a path."""
+        seen = []
+        for _, _, trip_id, _, route_label in path:
+            if trip_id is not None:
+                key = route_label or trip_id  # use line label (e.g. "metro m1") not trip instance
+                if not seen or seen[-1] != key:
+                    seen.append(key)
+        return tuple(seen)
 
     # helper to get human-readable route name
     def _route_label(self, trip_id):
@@ -230,7 +216,8 @@ class JourneyPlanner:
         dow_bucket  = _DAY_TO_DOW_BUCKET[day.lower()]
 
         results          = []
-        current_deadline = deadline
+        current_max_dep = None
+        seen_sequences = set()
         max_attempts     = max_routes * 10
         attempts         = 0
 
@@ -238,37 +225,41 @@ class JourneyPlanner:
             attempts += 1
 
             path, scan_confidence, n_transfers, walk_m = self._backward_csa(
-                start_id, end_id, current_deadline, day_col,
+                start_id, end_id, deadline, day_col,
                 min_transfer_secs, max_walk_m,
                 confidence_threshold=confidence_threshold,
                 dow_bucket=dow_bucket,
+                max_dep_time=current_max_dep,
             )
             if not path:
                 break
 
             dep_time = path[0][0]
             arr_time = path[-1][0]
+            for event in reversed(path):
+                if event[2] is not None and event[3] is not None:  # alight event
+                    arr_time = event[0]
+                    break
             # Pareto pivot: use the last *transit* event time (alight or board), not
             # arr_time.  When the final segment is a walk, arr_time == current_deadline
             # (T[destination] = deadline), so arr_time - 1 would only decrement by one
             # second each iteration, producing near-duplicate routes.  Walk events have
             # event[2] = None (trip_id); transit events have event[2] != None.
-            last_transit_time = dep_time
-            for event in reversed(path):
-                if event[2] is not None:
-                    last_transit_time = event[0]
-                    break
-            current_deadline = last_transit_time - 1
+            current_max_dep = dep_time
+            trip_seq = self._trip_sequence(path)
+            if trip_seq in seen_sequences:
+                continue
+            seen_sequences.add(trip_seq)
+            
 
             if scan_confidence >= confidence_threshold:
-                true_conf = (
-                    self._confidence(path, min_transfer_secs, dow_bucket=dow_bucket)
-                    if confidence_threshold == 0.0
-                    else scan_confidence
-                )
+
+                # when confidence_threshold=0.0, scan_confidence will always be 1.0 
+                # because _p_transfer returns 1.0 in deterministic mode, so every label propagates as C=1.0. 
+                # This means Q=0 routes will show confidence=100% in the output
                 results.append({
                     'path':        path,
-                    'confidence':  true_conf,
+                    'confidence':  scan_confidence,
                     'dep_time':    dep_time,
                     'arr_time':    arr_time,
                     'n_transfers': n_transfers,  # STEP 4
@@ -284,7 +275,7 @@ class JourneyPlanner:
     def _backward_csa(self, start_id, end_id, deadline, day_col,
                       min_transfer_secs, max_walk_m,
                       confidence_threshold=0.0,
-                      dow_bucket=DOW_BUCKET_WEEKDAY):
+                      dow_bucket=DOW_BUCKET_WEEKDAY, max_dep_time=None):
         """
         Backward CSA: find the latest-departing path from start_id to end_id by deadline,
         with confidence >= confidence_threshold at every transfer.
@@ -355,13 +346,29 @@ class JourneyPlanner:
                 trip_id    = self.trip_ids[trip_idx]
                 product_id = self.trip_products.get(trip_id)
                 line_text  = self.trip_lines.get(trip_id)
-                p_transfer = self._p_transfer(
-                    arr_stop, arr_time, slack_sec,
-                    confidence_threshold,
-                    dow_bucket=dow_bucket,
-                    product_id=product_id,
-                    line_text=line_text,
+
+                
+                # Option A: only penalise confidence when this is a genuine transfer or
+                # final arrival. If arr_stop was already labelled by the same trip
+                # propagating backwards, p_transfer = 1.0 (passenger stays on vehicle).
+                arr_pred = predecessor.get(arr_stop)
+                arr_pred_trip  = arr_pred[1] if arr_pred else None
+                arr_pred_label = self._route_label(arr_pred_trip) if arr_pred_trip else None
+                this_label     = self._route_label(trip_id)
+                is_real_transfer = (
+                    arr_stop == end_id                          or
+                    arr_pred is None                            or
+                    arr_pred_trip is None                       or   # arr_stop reached by walking
+                    (arr_pred_label != this_label)                   # different LINE, not just different trip_id
                 )
+
+                p_transfer = (
+                    self._p_transfer(arr_stop, arr_time, slack_sec, confidence_threshold,
+                                     dow_bucket=dow_bucket,
+                                     product_id=product_id, line_text=line_text)
+                    if is_real_transfer else 1.0
+                )
+
 
                 c_new = p_transfer * C[arr_stop]
 
@@ -388,6 +395,11 @@ class JourneyPlanner:
             #   (a) it departs strictly later (always better), OR
             #   (b) it departs at the same time but has fewer transfers, OR
             #   (c) it departs at the same time, same transfers, but less walking.
+            # reject labels at start_id that depart too late
+            if max_dep_time is not None and dep_stop == start_id and dep_time >= max_dep_time:
+                continue
+
+            
             existing_time = T[dep_stop]
             if dep_time < existing_time:
                 continue  # strictly worse on primary criterion — reject
@@ -476,11 +488,16 @@ class JourneyPlanner:
         """
         Reconstruct path from backward CSA predecessor dict.
         predecessor[stop] = (next_stop, trip_id, dep_time, arr_time)
+
+        Consecutive hops on the same trip_id are collapsed into a single
+        board+alight pair so that through-rides on metro/bus/train lines are
+        not displayed as repeated alight-and-reboard events.
         """
         if start_id not in predecessor:
             return []
 
-        events  = []
+        # 1. Build the raw hop chain
+        hops    = []
         current = start_id
         visited = {start_id}
 
@@ -489,19 +506,53 @@ class JourneyPlanner:
                 break
             next_stop, trip_id, dep_time, arr_time = predecessor[current]
             if next_stop in visited:
-                return []  # cycle in predecessor graph — discard path
+                return []  # cycle — discard
             visited.add(next_stop)
-
-            if trip_id is not None:
-                label = self._route_label(trip_id)
-                events.append((dep_time, current, trip_id, None, label))      # board
-                events.append((arr_time, None, trip_id, next_stop, label))    # alight
-            else:
-                events.append((dep_time, current, None, next_stop, None)) # walk
-
+            hops.append((current, next_stop, trip_id, dep_time, arr_time))
             current = next_stop
 
+        if not hops:
+            return []
+
+        # 2. Collapse consecutive hops on the same trip into one board+alight pair
+        events = []
+        i = 0
+        while i < len(hops):
+            from_stop, to_stop, trip_id, dep_time, arr_time = hops[i]
+
+            if trip_id is None:
+                # walking hop — emit as-is
+                events.append((dep_time, from_stop, None, to_stop, None))
+                i += 1
+            else:
+                # scan forward while the trip_id is the same
+                board_stop = from_stop
+                board_time = dep_time
+                alight_stop = to_stop
+                alight_time = arr_time
+                j = i + 1
+                while j < len(hops) and (hops[j][2] == trip_id or self._route_label(hops[j][2]) == self._route_label(trip_id)):
+                    alight_stop = hops[j][1]
+                    alight_time = hops[j][4]
+                    j += 1
+
+                label = self._route_label(trip_id)
+                events.append((board_time,  board_stop,  trip_id, None,        label))  # board
+                events.append((alight_time, None,        trip_id, alight_stop, label))  # alight
+                i = j
+
         return sorted(events, key=lambda x: x[0])
+
+    def _would_create_cycle(self, neighbor, from_stop, predecessor):
+        """Return True if setting predecessor[neighbor] = (from_stop, ...) would create a cycle."""
+        current = from_stop
+        seen = {neighbor}
+        while current in predecessor:
+            if current in seen:
+                return True
+            seen.add(current)
+            current = predecessor[current][0]
+        return False
 
     def _propagate_walking_backward(self, from_stop, from_time, T, C, N, W, predecessor,
                                     min_transfer_secs, max_walk_m):
@@ -531,51 +582,81 @@ class JourneyPlanner:
                 if N[from_stop] == N[neighbor] and w_at_neighbor >= W[neighbor]:
                     continue
 
-            T[neighbor]           = t_at_neighbor
-            C[neighbor]           = C[from_stop]
-            N[neighbor]           = N[from_stop]   # walking doesn't add a transfer
-            W[neighbor]           = w_at_neighbor  # STEP 4: accumulate walk distance
-            predecessor[neighbor] = (from_stop, None, t_at_neighbor, from_time)
+            T[neighbor] = t_at_neighbor
+            C[neighbor] = C[from_stop]
+            N[neighbor] = N[from_stop]   # walking doesn't add a transfer
+            W[neighbor] = w_at_neighbor  # STEP 4: accumulate walk distance
+            if not self._would_create_cycle(neighbor, from_stop, predecessor):
+                predecessor[neighbor] = (from_stop, None, t_at_neighbor, from_time)
 
     def _confidence(self, path, min_transfer_secs, dow_bucket=DOW_BUCKET_WEEKDAY):
         """
-        Post-hoc confidence calculation for a reconstructed path.
+        .. deprecated::
+            Does not include the final leg arrival penalty.
+            Use _confidence_with_final_leg() instead, which matches scan_confidence.
+            Kept only for backward compatibility — do not call directly.
+        """
+        return self._confidence_with_final_leg(
+            path,
+            deadline=None,   # no final leg penalty
+            min_transfer_secs=min_transfer_secs,
+            dow_bucket=dow_bucket,
+        )
 
-        Available for the validation harness and any external caller that wants
-        to independently verify the confidence of a given path. Internal routing
-        uses scan-integrated confidence via _p_transfer().
+    def _confidence_with_final_leg(self, path, deadline, min_transfer_secs,
+                                   dow_bucket=DOW_BUCKET_WEEKDAY):
+        """
+        Like _confidence() but also penalises the final leg arrival.
+        P(all transfers caught) × P(last vehicle arrives at end_id by deadline).
+        This matches scan_confidence from _backward_csa.
         """
         if not self.delay_features and self.delay_lookup is None:
             return 1.0
-
+    
         p_total          = 1.0
         last_alight_stop = None
         last_alight_time = None
         last_trip_id     = None
-
-        for ts, s1, trip_id, s2, route_label in path:
-            if trip_id is not None and s2 is None:  # board event
+        final_alight_stop = None
+        final_alight_time = None
+    
+        for ts, s1, trip_id, s2, *_ in path:
+            if trip_id is not None and s2 is None:   # board
                 if last_alight_time is not None and trip_id != last_trip_id:
+                    # real transfer
                     slack_sec  = ts - last_alight_time
                     product_id = self.trip_products.get(trip_id)
                     line_text  = self.trip_lines.get(trip_id)
-                    p_catch    = self._p_transfer(
+                    p_total   *= self._p_transfer(
                         last_alight_stop, last_alight_time, slack_sec,
                         confidence_threshold=1.0,
                         dow_bucket=dow_bucket,
                         product_id=product_id,
                         line_text=line_text,
                     )
-                    p_total *= p_catch
-
-            elif trip_id is not None and s1 is None:  # alight event
-                last_alight_stop = s2
-                last_alight_time = ts
-                last_trip_id     = trip_id
-
+            elif trip_id is not None and s1 is None:  # alight
+                last_alight_stop  = s2
+                last_alight_time  = ts
+                last_trip_id      = trip_id
+                final_alight_stop = s2
+                final_alight_time = ts
+    
+        # Final leg: P(last vehicle arrives by deadline)
+        if final_alight_stop is not None and final_alight_time is not None:
+            slack_sec  = deadline - final_alight_time
+            product_id = self.trip_products.get(last_trip_id)
+            line_text  = self.trip_lines.get(last_trip_id)
+            p_total   *= self._p_transfer(
+                final_alight_stop, final_alight_time, slack_sec,
+                confidence_threshold=1.0,
+                dow_bucket=dow_bucket,
+                product_id=product_id,
+                line_text=line_text,
+            )
+    
         return p_total
 
-    def explain_confidence(self, route_result, min_transfer_secs=120,
+    def explain_confidence(self, route_result, arrives_by=None, min_transfer_secs=120,
                            dow_bucket=DOW_BUCKET_WEEKDAY):
         """
         Print a per-transfer confidence breakdown for a route result dict
@@ -595,7 +676,15 @@ class JourneyPlanner:
 
         # Recompute true confidence (route_result['confidence'] may be 1.0 when
         # the search was run with confidence_threshold=0.0).
-        true_conf = self._confidence(path, min_transfer_secs, dow_bucket=dow_bucket)
+        # Recompute confidence the same way scan_confidence does:
+        # product of p_transfer at each real transfer AND the final arrival.
+        true_conf = route_result['confidence']
+        # If the route was run at Q=0 (confidence=1.0), recompute properly
+        # by re-calling _p_transfer at each transfer and at the final leg.
+        if true_conf == 1.0 and arrives_by is not None:
+            h, m = arrives_by.split(':')
+            deadline = int(h) * 3600 + int(m) * 60
+            true_conf = self._confidence_with_final_leg(path, deadline, min_transfer_secs, dow_bucket)
         print(f"Route: {fmt(route_result['dep_time'])} → {fmt(route_result['arr_time'])}  "
               f"(true confidence: {true_conf:.0%})")
         print()
@@ -663,7 +752,7 @@ class JourneyPlanner:
                 last_trip_id     = trip_id
 
             else:   # walk
-                _, ts, s1, s2, _ = leg
+                _, ts, s1, s2 = leg
                 n1 = self.stops.get(s1, {}).get('name', s1)
                 n2 = self.stops.get(s2, {}).get('name', s2)
                 print(f"  🚶 {fmt(ts)} Walk   {n1} → {n2}")
@@ -772,14 +861,22 @@ class JourneyPlanner:
                         print(f"  SKIP (time): {ds_n}→{as_n} dep={fmt(dep_time)} arr={fmt(arr_time)} "
                               f"arr+tr={fmt(arr_time+transfer)} > T[{as_n}]={fmt(T[arr_stop])}")
                     continue
-
                 slack_sec  = T[arr_stop] - arr_time - transfer
                 trip_id    = self.trip_ids[trip_idx]
                 product_id = self.trip_products.get(trip_id)
                 line_text  = self.trip_lines.get(trip_id)
-                p_transfer = self._p_transfer(arr_stop, arr_time, slack_sec, confidence_threshold,
-                                              dow_bucket=dow_bucket,
-                                              product_id=product_id, line_text=line_text)
+                arr_pred = predecessor.get(arr_stop)
+                is_real_transfer = (
+                    arr_stop == end_id or
+                    arr_pred is None or
+                    arr_pred[1] is None or
+                    arr_pred[1] != trip_id
+                )
+                p_transfer = (
+                    self._p_transfer(arr_stop, arr_time, slack_sec, confidence_threshold,
+                                     dow_bucket=dow_bucket, product_id=product_id, line_text=line_text)
+                    if is_real_transfer else 1.0
+                )
                 c_new = p_transfer * C[arr_stop]
 
                 if c_new < confidence_threshold:
@@ -833,5 +930,3 @@ class JourneyPlanner:
         print(f"\nScan ended: {break_reason}")
         sn = self.stops.get(start_id,{}).get('name',start_id)
         print(f"T[{sn}] = {fmt(T[start_id]) if T[start_id]!=NEG_INF else 'NEG_INF'}")
-
-# %%
